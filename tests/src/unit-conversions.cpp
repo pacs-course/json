@@ -1657,6 +1657,84 @@ TEST_CASE("JSON to enum mapping")
     }
 }
 
+enum class strict_cards {kreuz, pik, herz, karo, andere}; // andere not included in mapping
+
+// NOLINTNEXTLINE(misc-use-internal-linkage,misc-const-correctness,cppcoreguidelines-avoid-c-arrays,hicpp-avoid-c-arrays,modernize-avoid-c-arrays) - false positive
+NLOHMANN_JSON_SERIALIZE_ENUM_STRICT(strict_cards,
+{
+    {strict_cards::kreuz, "kreuz"},
+    {strict_cards::pik, "pik"},
+    {strict_cards::pik, "puk"},  // second entry for cards::pik; will not be used
+    {strict_cards::herz, "herz"},
+    {strict_cards::karo, "karo"}
+})
+
+enum StrictTaskState // NOLINT(cert-int09-c,readability-enum-initial-value,cppcoreguidelines-use-enum-class)
+{
+    STRICT_TS_STOPPED,
+    STRICT_TS_RUNNING,
+    STRICT_TS_COMPLETED,
+    STRICT_TS_OTHER, // STRICT_TS_OTHER not in mapping
+    STRICT_TS_INVALID = -1,
+};
+
+// NOLINTNEXTLINE(misc-const-correctness,misc-use-internal-linkage,cppcoreguidelines-avoid-c-arrays,hicpp-avoid-c-arrays,modernize-avoid-c-arrays) - false positive
+NLOHMANN_JSON_SERIALIZE_ENUM_STRICT(StrictTaskState,
+{
+    {STRICT_TS_INVALID, nullptr},
+    {STRICT_TS_STOPPED, "stopped"},
+    {STRICT_TS_RUNNING, "running"},
+    {STRICT_TS_COMPLETED, "completed"},
+})
+
+TEST_CASE("Strict JSON to enum mapping")
+{
+    SECTION("enum class")
+    {
+        // enum -> json
+        CHECK(json(strict_cards::kreuz) == "kreuz");
+        CHECK(json(strict_cards::pik) == "pik");
+        CHECK(json(strict_cards::herz) == "herz");
+        CHECK(json(strict_cards::karo) == "karo");
+
+        // json -> enum
+        CHECK(strict_cards::kreuz == json("kreuz"));
+        CHECK(strict_cards::pik == json("pik"));
+        CHECK(strict_cards::herz == json("herz"));
+        CHECK(strict_cards::karo == json("karo"));
+
+        // invalid json -> exception thrown
+        json _;
+        CHECK_THROWS_WITH_AS(_ = json("what?").get<strict_cards>(), "[json.exception.out_of_range.410] enum value out of range for strict_cards: \"what?\"", json::out_of_range&);
+
+        // conversion of unmapped enum -> exception thrown
+        CHECK_THROWS_WITH_AS(json(strict_cards::andere), "[json.exception.out_of_range.410] enum value out of range for strict_cards", json::out_of_range&);
+    }
+
+    SECTION("traditional enum")
+    {
+        // enum -> json
+        CHECK(json(STRICT_TS_STOPPED) == "stopped");
+        CHECK(json(STRICT_TS_RUNNING) == "running");
+        CHECK(json(STRICT_TS_COMPLETED) == "completed");
+        CHECK(json(STRICT_TS_INVALID) == json());
+
+        // json -> enum
+        CHECK(STRICT_TS_STOPPED == json("stopped"));
+        CHECK(STRICT_TS_RUNNING == json("running"));
+        CHECK(STRICT_TS_COMPLETED == json("completed"));
+        CHECK(STRICT_TS_INVALID == json());
+
+        // invalid json -> exception thrown
+        json _;
+        CHECK_THROWS_WITH_AS(_ = json("what?").get<StrictTaskState>(), "[json.exception.out_of_range.410] enum value out of range for StrictTaskState: \"what?\"", json::out_of_range&);
+
+        // conversion of unmapped enum -> exception thrown
+        CHECK_THROWS_WITH_AS(json(STRICT_TS_OTHER), "[json.exception.out_of_range.410] enum value out of range for StrictTaskState", json::out_of_range&);
+    }
+}
+
+
 #ifdef JSON_HAS_CPP_17
 #if JSON_HAS_FILESYSTEM || JSON_HAS_EXPERIMENTAL_FILESYSTEM
 TEST_CASE("std::filesystem::path")
@@ -1683,16 +1761,42 @@ TEST_CASE("std::filesystem::path")
 }
 #endif
 
-#ifndef JSON_USE_IMPLICIT_CONVERSIONS
 TEST_CASE("std::optional")
 {
     SECTION("null")
     {
-        json j_null;
-        std::optional<std::string> opt_null;
+        const json j_null;
+        const std::optional<std::string> opt_null;
 
         CHECK(json(opt_null) == j_null);
         CHECK(j_null.get<std::optional<std::string>>() == std::nullopt);
+
+        // Constructing std::optional<T> directly from JSON null throws because
+        // std::optional's own converting constructor is chosen over basic_json's
+        // operator T(). This is a language-level limitation (std::optional<T> is
+        // constructible from T, and T is constructible from basic_json via the
+        // operator); there is no SFINAE path that distinguishes "call from inside
+        // std::optional's constructor" from "direct call". Use get<std::optional<T>>()
+        // or get_to() instead for correct null handling. See #4864 and #5246.
+        CHECK_THROWS_WITH_AS(std::optional<std::string>(j_null),
+                             "[json.exception.type_error.302] type must be string, but is null", json::type_error&);
+        CHECK_THROWS_WITH_AS(std::optional<int>(j_null),
+                             "[json.exception.type_error.302] type must be number, but is null", json::type_error&);
+
+        // Assignment goes through the same overload resolution as direct
+        // construction, so it throws for the same reason. This relies on
+        // basic_json's implicit conversion operator, so it only applies
+        // when JSON_USE_IMPLICIT_CONVERSIONS is enabled (the default).
+#if JSON_USE_IMPLICIT_CONVERSIONS
+        std::optional<std::string> opt_assign;
+        CHECK_THROWS_WITH_AS(opt_assign = j_null,
+                             "[json.exception.type_error.302] type must be string, but is null", json::type_error&);
+#endif
+
+        // get_to() is the correct way to obtain std::nullopt from a JSON null.
+        std::optional<std::string> opt_get_to = "placeholder";
+        j_null.get_to(opt_get_to);
+        CHECK(opt_get_to == std::nullopt);
     }
 
     SECTION("string")
@@ -1740,7 +1844,6 @@ TEST_CASE("std::optional")
         CHECK(std::map<std::string, std::optional<int>>(j_object) == opt_object);
     }
 }
-#endif
 #endif
 
 #ifdef JSON_HAS_CPP_17

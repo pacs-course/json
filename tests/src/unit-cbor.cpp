@@ -1921,6 +1921,15 @@ TEST_CASE("single CBOR roundtrip")
     }
 }
 
+TEST_CASE("Parse CBOR directly from a file using iterator and sentinel")
+{
+    std::string const filename = TEST_DATA_DIRECTORY "/json_testsuite/sample.json.cbor";
+    std::ifstream file(filename, std::ios::binary);
+    const std::istreambuf_iterator<char> first(file);
+    const json parsed = json::from_cbor(first, utils::istreambuf_sentinel{});
+    CHECK((parsed.is_object() || parsed.is_array()));
+}
+
 #if !defined(JSON_NOEXCEPTION)
 TEST_CASE("CBOR regressions")
 {
@@ -1989,6 +1998,42 @@ TEST_CASE("CBOR regressions")
     }
 }
 #endif
+
+TEST_CASE("CBOR definite length equal to the indefinite-length sentinel")
+{
+    // A definite-length array or map whose declared element count equals the
+    // reserved unknown_size() sentinel (SIZE_MAX) must be rejected. Otherwise
+    // it is read as an indefinite-length container and the following bytes are
+    // silently accepted instead of the (impossible) count being reported.
+    json _;
+
+    SECTION("array")
+    {
+        // 0x9B: array with eight-byte length; length = 0xFFFFFFFFFFFFFFFF
+        const std::vector<uint8_t> input = {0x9B, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x01, 0x02, 0xFF};
+        CHECK_THROWS_WITH_AS(_ = json::from_cbor(input), "[json.exception.out_of_range.408] syntax error while parsing CBOR size: excessive array size", json::out_of_range&);
+    }
+
+    SECTION("map")
+    {
+        // 0xBB: map with eight-byte length; length = 0xFFFFFFFFFFFFFFFF
+        const std::vector<uint8_t> input = {0xBB, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x61, 0x61, 0x01, 0xFF};
+        CHECK_THROWS_WITH_AS(_ = json::from_cbor(input), "[json.exception.out_of_range.408] syntax error while parsing CBOR size: excessive map size", json::out_of_range&);
+    }
+
+    SECTION("indefinite-length containers are unaffected")
+    {
+        CHECK(json::from_cbor(std::vector<uint8_t>({0x9F, 0x01, 0x02, 0xFF})) == json({1, 2}));
+        CHECK(json::from_cbor(std::vector<uint8_t>({0xBF, 0x61, 0x61, 0x01, 0xFF})) == json({{"a", 1}}));
+    }
+
+    SECTION("ordinary four-byte length containers are unaffected")
+    {
+        // 0x9A/0xBA carry a four-byte length; a normal count still parses
+        CHECK(json::from_cbor(std::vector<uint8_t>({0x9A, 0x00, 0x00, 0x00, 0x02, 0x01, 0x02})) == json({1, 2}));
+        CHECK(json::from_cbor(std::vector<uint8_t>({0xBA, 0x00, 0x00, 0x00, 0x01, 0x61, 0x61, 0x01})) == json({{"a", 1}}));
+    }
+}
 
 TEST_CASE("CBOR roundtrips" * doctest::skip())
 {
@@ -2300,7 +2345,7 @@ TEST_CASE("all CBOR first bytes")
 }
 #endif
 
-TEST_CASE("examples from RFC 7049 Appendix A")
+TEST_CASE("examples from RFC 8949 Appendix A")
 {
     SECTION("numbers")
     {
@@ -2776,5 +2821,45 @@ TEST_CASE("Tagged values")
         CHECK(jb.is_object());
         CHECK(jb["binary"].is_binary());
         CHECK(!jb["binary"].get_binary().has_subtype());
+    }
+}
+
+TEST_CASE("CBOR large strings and binaries (chunked reader)")
+{
+    // The binary reader reads strings and byte arrays in bounded chunks; make
+    // sure roundtripping is correct for lengths around and beyond the internal
+    // chunk size (4096 bytes), for both vector (iterator) and pointer inputs.
+    for (const std::size_t len :
+            {
+                std::size_t{0}, std::size_t{1}, std::size_t{4095}, std::size_t{4096},
+                std::size_t{4097}, std::size_t{8192}, std::size_t{100000}
+            })
+    {
+        CAPTURE(len);
+
+        // text string
+        const json j_string = std::string(len, 'x');
+        const std::vector<std::uint8_t> v_string = json::to_cbor(j_string);
+        CHECK(json::from_cbor(v_string) == j_string);
+        // pointer input exercises the std::memcpy fast path
+        CHECK(json::from_cbor(reinterpret_cast<const char*>(v_string.data()),
+                              reinterpret_cast<const char*>(v_string.data()) + v_string.size()) == j_string);
+
+        // byte string
+        const json j_binary = json::binary(std::vector<std::uint8_t>(len, 0xCD));
+        const std::vector<std::uint8_t> v_binary = json::to_cbor(j_binary);
+        CHECK(json::from_cbor(v_binary) == j_binary);
+        CHECK(json::from_cbor(reinterpret_cast<const char*>(v_binary.data()),
+                              reinterpret_cast<const char*>(v_binary.data()) + v_binary.size()) == j_binary);
+
+        // a truncated payload must still be reported as an error, never crash
+        // or loop, regardless of the (large) announced length
+        if (len > 16)
+        {
+            std::vector<std::uint8_t> truncated = v_string;
+            truncated.resize(truncated.size() - 8);
+            json _;
+            CHECK_THROWS_AS(_ = json::from_cbor(truncated), json::parse_error);
+        }
     }
 }

@@ -819,6 +819,8 @@ TEST_CASE("UBJSON")
                     CHECK_THROWS_WITH_AS(_ = json::from_ubjson(vec2), "[json.exception.parse_error.115] parse error at byte 5: syntax error while parsing UBJSON high-precision number: invalid number text: 1A", json::parse_error);
                     std::vector<uint8_t> const vec3 = {'H', 'i', 2, '1', '.'};
                     CHECK_THROWS_WITH_AS(_ = json::from_ubjson(vec3), "[json.exception.parse_error.115] parse error at byte 5: syntax error while parsing UBJSON high-precision number: invalid number text: 1.", json::parse_error);
+                    std::vector<uint8_t> const vec_overflow = {'H', 'i', 5, '1', 'e', '4', '0', '0'};
+                    CHECK_THROWS_WITH_AS(_ = json::from_ubjson(vec_overflow), "[json.exception.out_of_range.406] number overflow parsing '1e400'", json::out_of_range&);
                     std::vector<uint8_t> const vec4 = {'H', 2, '1', '0'};
                     CHECK_THROWS_WITH_AS(_ = json::from_ubjson(vec4), "[json.exception.parse_error.113] parse error at byte 2: syntax error while parsing UBJSON size: expected length type specification (U, i, I, l, L) after '#'; last byte: 0x02", json::parse_error);
                 }
@@ -1711,6 +1713,44 @@ TEST_CASE("UBJSON")
             CHECK(json::to_ubjson(json::from_ubjson(s_L)) == s_i);
         }
 
+        SECTION("no-op markers")
+        {
+            // A no-op ('N') is valid wherever a value may start; it is consumed
+            // by get_ignore_noop() before the value is read. It is not valid
+            // where a string length type specification is expected.
+
+            SECTION("accepted where a value may start")
+            {
+                // at top level, also repeated
+                CHECK(json::from_ubjson(std::vector<uint8_t>({'N', 'i', 1})) == json(1));
+                CHECK(json::from_ubjson(std::vector<uint8_t>({'N', 'N', 'N', 'i', 1})) == json(1));
+
+                // inside an array of unknown size, before and after an element
+                CHECK(json::from_ubjson(std::vector<uint8_t>({'[', 'N', 'i', 1, ']'})) == json({1}));
+                CHECK(json::from_ubjson(std::vector<uint8_t>({'[', 'i', 1, 'N', ']'})) == json({1}));
+
+                // inside an object of unknown size: before a key, between key
+                // and value, and before the closing '}'
+                CHECK(json::from_ubjson(std::vector<uint8_t>({'{', 'N', 'U', 1, 'a', 'i', 1, '}'})) == json({{"a", 1}}));
+                CHECK(json::from_ubjson(std::vector<uint8_t>({'{', 'U', 1, 'a', 'N', 'i', 1, '}'})) == json({{"a", 1}}));
+                CHECK(json::from_ubjson(std::vector<uint8_t>({'{', 'U', 1, 'a', 'i', 1, 'N', '}'})) == json({{"a", 1}}));
+            }
+
+            SECTION("rejected where a length type specification is expected")
+            {
+                json _;
+
+                // after the 'S' marker of a string value
+                std::vector<uint8_t> const v_S = {'S', 'N', 'U', 1, 'a'};
+                CHECK_THROWS_WITH_AS(_ = json::from_ubjson(v_S), "[json.exception.parse_error.113] parse error at byte 2: syntax error while parsing UBJSON string: expected length type specification (U, i, I, l, L); last byte: 0x4E", json::parse_error&);
+
+                // as the key length of an object with a known size, where
+                // no-ops are not permitted in the first place
+                std::vector<uint8_t> const v_key = {'{', '#', 'i', 1, 'N', 'U', 1, 'a', 'i', 1};
+                CHECK_THROWS_WITH_AS(_ = json::from_ubjson(v_key), "[json.exception.parse_error.113] parse error at byte 5: syntax error while parsing UBJSON string: expected length type specification (U, i, I, l, L); last byte: 0x4E", json::parse_error&);
+            }
+        }
+
         SECTION("number")
         {
             SECTION("float")
@@ -1861,6 +1901,31 @@ TEST_CASE("UBJSON")
                 std::vector<uint8_t> const v = {'S', '1', 'a'};
                 json _;
                 CHECK_THROWS_WITH_AS(_ = json::from_ubjson(v), "[json.exception.parse_error.113] parse error at byte 2: syntax error while parsing UBJSON string: expected length type specification (U, i, I, l, L); last byte: 0x31", json::parse_error&);
+            }
+
+            SECTION("negative length")
+            {
+                json _;
+
+                std::vector<uint8_t> const vi = {'S', 'i', 0xFF};
+                CHECK_THROWS_WITH_AS(_ = json::from_ubjson(vi), "[json.exception.parse_error.113] parse error at byte 3: syntax error while parsing UBJSON string: string length must not be negative", json::parse_error&);
+                CHECK(json::from_ubjson(vi, true, false).is_discarded());
+
+                std::vector<uint8_t> const vI = {'S', 'I', 0xFF, 0xFF};
+                CHECK_THROWS_WITH_AS(_ = json::from_ubjson(vI), "[json.exception.parse_error.113] parse error at byte 4: syntax error while parsing UBJSON string: string length must not be negative", json::parse_error&);
+                CHECK(json::from_ubjson(vI, true, false).is_discarded());
+
+                std::vector<uint8_t> const vl = {'S', 'l', 0xFF, 0xFF, 0xFF, 0xFF};
+                CHECK_THROWS_WITH_AS(_ = json::from_ubjson(vl), "[json.exception.parse_error.113] parse error at byte 6: syntax error while parsing UBJSON string: string length must not be negative", json::parse_error&);
+                CHECK(json::from_ubjson(vl, true, false).is_discarded());
+
+                std::vector<uint8_t> const vL = {'S', 'L', 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+                CHECK_THROWS_WITH_AS(_ = json::from_ubjson(vL), "[json.exception.parse_error.113] parse error at byte 10: syntax error while parsing UBJSON string: string length must not be negative", json::parse_error&);
+                CHECK(json::from_ubjson(vL, true, false).is_discarded());
+
+                // a length of zero remains valid and yields an empty string
+                std::vector<uint8_t> const v0 = {'S', 'i', 0};
+                CHECK(json::from_ubjson(v0) == json(""));
             }
         }
 
@@ -2391,6 +2456,15 @@ TEST_CASE("Universal Binary JSON Specification Examples 1")
             }
         }
     }
+}
+
+TEST_CASE("Parse UBJSON directly from a file using iterator and sentinel")
+{
+    std::string const filename = TEST_DATA_DIRECTORY "/json_testsuite/sample.json.ubjson";
+    std::ifstream file(filename, std::ios::binary);
+    const std::istreambuf_iterator<char> first(file);
+    const json parsed = json::from_ubjson(first, utils::istreambuf_sentinel{});
+    CHECK((parsed.is_object() || parsed.is_array()));
 }
 
 #if !defined(JSON_NOEXCEPTION)

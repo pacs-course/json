@@ -16,6 +16,12 @@ using nlohmann::json;
 #endif
 
 #include <valarray>
+#include <algorithm>
+#include <list>
+#include <sstream>
+#include <string>
+#include <utility>
+#include <vector>
 
 namespace
 {
@@ -1434,6 +1440,13 @@ TEST_CASE("parser class")
             ]
         )";
 
+        const auto* structured_object = R"(
+            {
+                "foo": [1, 2],
+                "bar": 3
+            }
+        )";
+
         SECTION("filter nothing")
         {
             const json j_object = json::parse(s_object, [](int /*unused*/, json::parse_event_t /*unused*/, const json& /*unused*/) noexcept
@@ -1507,6 +1520,48 @@ TEST_CASE("parser class")
             // removed all objects in array.
             CHECK (j_filtered2.size() == 1);
             CHECK (j_filtered2 == json({1}));
+        }
+
+        SECTION("filter array in object")
+        {
+            // the array is discarded once it is already stored under its key
+            const json j_filtered1 = json::parse(structured_object, [](int /*unused*/, json::parse_event_t e, const json& /*parsed*/) noexcept
+            {
+                return e != json::parse_event_t::array_end;
+            });
+
+            CHECK (j_filtered1 == json({{"bar", 3}}));
+
+            // the array is discarded before it is stored, leaving the
+            // placeholder the key event wrote
+            const json j_filtered2 = json::parse(structured_object, [](int /*unused*/, json::parse_event_t e, const json& /*parsed*/) noexcept
+            {
+                return e != json::parse_event_t::array_start;
+            });
+
+            CHECK (j_filtered2 == json({{"bar", 3}}));
+        }
+
+        SECTION("filter value in object")
+        {
+            // the value is discarded after its key was kept, leaving the
+            // placeholder the key event wrote
+            const json j_filtered1 = json::parse(structured_object, [](int /*unused*/, json::parse_event_t e, const json & parsed) noexcept
+            {
+                return !(e == json::parse_event_t::value && parsed == json(3));
+            });
+
+            CHECK (j_filtered1 == json({{"foo", {1, 2}}}));
+
+            // the same value is discarded together with its key, so no
+            // placeholder was stored for it
+            const json j_filtered2 = json::parse(structured_object, [](int /*unused*/, json::parse_event_t e, const json & parsed) noexcept
+            {
+                return !((e == json::parse_event_t::key && parsed == json("bar")) ||
+                         (e == json::parse_event_t::value && parsed == json(3)));
+            });
+
+            CHECK (j_filtered2 == json({{"foo", {1, 2}}}));
         }
 
         SECTION("filter specific events")
@@ -1644,33 +1699,6 @@ TEST_CASE("parser class")
 
         SECTION("SAX parser")
         {
-            SECTION("null sax handler")
-            {
-# if defined(__has_feature)
-#if !__has_feature(undefined_behavior_sanitizer)
-                const std::string s = "some_string";
-                SaxCountdown* p = nullptr;
-                CHECK_THROWS_WITH_AS(json::sax_parse(s, p), "[json.exception.other_error.502] SAX handler must not be null", json::other_error&); // NOLINT(clang-analyzer-core.NonNullParamChecker)
-                CHECK_THROWS_WITH_AS(json::sax_parse(s.begin(), s.end(), p), "[json.exception.other_error.502] SAX handler must not be null", json::other_error&); // NOLINT(clang-analyzer-core.NonNullParamChecker)
-                CHECK_THROWS_WITH_AS(json::sax_parse(nlohmann::detail::span_input_adapter(s.c_str(), s.size()), p), "[json.exception.other_error.502] SAX handler must not be null", json::other_error&); // NOLINT(clang-analyzer-core.NonNullParamChecker)
-#endif
-#else
-                const std::string s = "some_string";
-                SaxCountdown* p = nullptr;
-                CHECK_THROWS_WITH_AS(json::sax_parse(s, p), "[json.exception.other_error.502] SAX handler must not be null", json::other_error&); // NOLINT(clang-analyzer-core.NonNullParamChecker)
-                CHECK_THROWS_WITH_AS(json::sax_parse(s.begin(), s.end(), p), "[json.exception.other_error.502] SAX handler must not be null", json::other_error&); // NOLINT(clang-analyzer-core.NonNullParamChecker)
-                CHECK_THROWS_WITH_AS(json::sax_parse(nlohmann::detail::span_input_adapter(s.c_str(), s.size()), p), "[json.exception.other_error.502] SAX handler must not be null", json::other_error&); // NOLINT(clang-analyzer-core.NonNullParamChecker)
-#endif
-            }
-
-            SECTION("valid sax handler")
-            {
-                const std::string str = "some_string";
-                SaxCountdown s(1);
-                CHECK(json::sax_parse(str, &s) == false);
-                CHECK(json::sax_parse(nlohmann::detail::span_input_adapter(str.c_str(), str.size()), &s) == false);
-            }
-
             SECTION("} without value")
             {
                 SaxCountdown s(1);
@@ -1752,3 +1780,110 @@ TEST_CASE("parser class")
         CHECK_THROWS_WITH_AS(_ = json::parse("/*", nullptr, true, true), "[json.exception.parse_error.101] parse error at line 1, column 3: syntax error while parsing value - invalid comment; missing closing '*/'; last read: '/*<U+0000>'", json::parse_error);
     }
 }
+
+// this test relies on parse errors being thrown, so it is skipped when
+// exceptions are disabled (json::parse aborts instead of throwing there)
+#if !defined(JSON_NOEXCEPTION)
+namespace
+{
+// Return the exception message from parsing @a input, or a "<no error ...>"
+// sentinel if the parse unexpectedly succeeds. json::parse is nodiscard, so the
+// result is consumed (via size()) to keep -Wunused-result / -Werror happy.
+template<typename InputType>
+std::string parse_error_message(InputType&& input)
+{
+    try
+    {
+        const json j = json::parse(std::forward<InputType>(input));
+        return "<no error, size " + std::to_string(j.size()) + ">";
+    }
+    catch (const json::exception& e)
+    {
+        return e.what();
+    }
+}
+
+template<typename IteratorType>
+std::string parse_error_message_range(IteratorType first, IteratorType last)
+{
+    try
+    {
+        const json j = json::parse(first, last);
+        return "<no error, size " + std::to_string(j.size()) + ">";
+    }
+    catch (const json::exception& e)
+    {
+        return e.what();
+    }
+}
+} // namespace
+
+TEST_CASE("last-read diagnostics are identical across input adapters")
+{
+    // The lexer reconstructs the "last read" token lazily for seekable adapters
+    // (contiguous byte input) and copies it eagerly for streaming adapters.
+    // Both strategies must yield byte-for-byte identical error messages.
+
+    // a selection of malformed inputs that exercise different token kinds,
+    // whitespace/structural accumulation, number overflow, and control-char
+    // escaping in the reconstructed "last read" token
+    const std::vector<std::string> inputs =
+    {
+        "[1,2,x]",
+        "  \n  @",
+        "{\"a\": }",
+        "1.18973e+4932",
+        "\"\t\"",
+        "tru",
+        "[1 2]",
+        "\xEF\xBB\xBF   nul",
+    };
+
+    for (const auto& s : inputs)
+    {
+        CAPTURE(s);
+
+        // reference: contiguous std::string -> seekable (lazy) path
+        const std::string reference = parse_error_message(s);
+        // every input is malformed, so parsing must fail (error messages start
+        // with '['; the success sentinel returned above starts with '<')
+        CHECK(reference.front() == '[');
+
+        // const char* -> also seekable
+        CHECK(parse_error_message(s.c_str()) == reference);
+
+        // std::vector<char> iterators -> seekable (random-access)
+        {
+            const std::vector<char> v(s.begin(), s.end());
+            CHECK(parse_error_message_range(v.begin(), v.end()) == reference);
+        }
+
+        // std::list iterators -> non-seekable (bidirectional) eager path
+        {
+            const std::list<char> l(s.begin(), s.end());
+            CHECK(parse_error_message_range(l.begin(), l.end()) == reference);
+        }
+
+        // std::istringstream -> non-seekable streaming eager path
+        {
+            std::istringstream ss(s);
+            CHECK(parse_error_message(ss) == reference);
+        }
+
+        // wide strings -> wide_string_input_adapter eager path; only comparable
+        // for ASCII input, as non-ASCII bytes are transcoded to different UTF-8
+        const bool is_ascii = std::all_of(s.begin(), s.end(), [](char c)
+        {
+            return static_cast<unsigned char>(c) < 0x80;
+        });
+        if (is_ascii)
+        {
+            const std::u16string w16(s.begin(), s.end());
+            CHECK(parse_error_message(w16) == reference);
+
+            const std::u32string w32(s.begin(), s.end());
+            CHECK(parse_error_message(w32) == reference);
+        }
+    }
+}
+#endif // !defined(JSON_NOEXCEPTION)

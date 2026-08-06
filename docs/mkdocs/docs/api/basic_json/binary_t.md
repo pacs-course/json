@@ -13,9 +13,8 @@ is compatible with both of the binary data formats that use binary subtyping, (t
 incompatible with each other, and it is up to the user to translate between them). The subtype is added to `BinaryType`
 via the helper type [byte_container_with_subtype](../byte_container_with_subtype/index.md).
 
-[CBOR's RFC 7049](https://tools.ietf.org/html/rfc7049) describes this type as:
-> Major type 2: a byte string. The string's length in bytes is represented following the rules for positive integers
-> (major type 0).
+[CBOR's RFC 8949](https://www.rfc-editor.org/rfc/rfc8949.html#section-3.1) describes this type as:
+> Major type 2: A byte string. The number of bytes in the string is equal to the argument.
 
 [MessagePack's documentation on the bin type
 family](https://github.com/msgpack/msgpack/blob/master/spec.md#bin-format-family) describes this type as:
@@ -37,11 +36,51 @@ represent a byte array in modern C++.
 `BinaryType`
 :   container type to store arrays
 
+    Although not formally expressed as a C++ concept, `BinaryType` must be default-constructible,
+    copy/move-constructible, and support `push_back()`, `.data()`, and `.size()`, because
+    [`byte_container_with_subtype`](../byte_container_with_subtype/index.md) derives directly from it. Its
+    `value_type` must additionally be exactly one byte wide (e.g., `std::uint8_t`/`char`/`std::byte`): the binary
+    serializers (CBOR, MessagePack, BSON, UBJSON) read and write the container's raw bytes via
+    `reinterpret_cast`, which is only correct for byte-sized elements -- a container like
+    `#!cpp std::vector<std::intptr_t>` will not work as `BinaryType`.
+
 ## Notes
 
 #### Default type
 
 The default values for `BinaryType` is `#!cpp std::vector<std::uint8_t>`.
+
+#### Custom BinaryType behavior
+
+When a custom `BinaryType` is configured (other than the default `#!cpp std::vector<std::uint8_t>`), you can assign
+values of that type directly to a `basic_json` instance, and they will automatically be recognized as binary values
+rather than arrays:
+
+```cpp
+using custom_json = nlohmann::basic_json<
+    nlohmann::ordered_map,  // ObjectType
+    std::vector,            // ArrayType
+    std::string,            // StringType
+    bool,                   // BooleanType
+    std::int64_t,           // NumberIntegerType
+    std::uint64_t,          // NumberUnsignedType
+    double,                 // NumberFloatType
+    std::allocator,         // AllocatorType
+    nlohmann::adl_serializer,
+    std::vector<std::byte>  // Custom BinaryType
+>;
+
+std::vector<std::byte> data{std::byte{1}, std::byte{2}, std::byte{3}};
+custom_json j = data;  // Creates a binary value, not an array
+assert(j.is_binary());
+
+// Round-tripping works seamlessly
+auto extracted = j.get<std::vector<std::byte>>();
+assert(extracted == data);
+```
+
+This automatic type detection is a convenience feature that only applies to custom (non-default) `BinaryType` configurations.
+The default `nlohmann::json` continues to treat `#!cpp std::vector<std::uint8_t>` as arrays for backward compatibility.
 
 #### Storage
 
